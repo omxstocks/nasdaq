@@ -91,9 +91,9 @@ def calculate_position_sizing(close_price, atr_value, ema21_pct=None, ema50_pct=
             sl_options = [sl_option1, sl_option2]
 
             if donchian_support is not None:
-                sl_options.append(donchian_support)
-
-            sl = min(sl_options)
+                sl = donchian_support
+            else:
+                sl = min(sl_options)
 
             # Target options: EMA21-based, ATR-based, EMA50-based, or Donchian resistance
             target_option1 = close_price + (1.5 * (close_price - ema21_price))
@@ -114,9 +114,11 @@ def calculate_position_sizing(close_price, atr_value, ema21_pct=None, ema50_pct=
         else:
             # Fallback to ATR-only if EMA21 not available
             sl_options = [close_price - (1.5 * atr_value)]
+            
             if donchian_support is not None:
-                sl_options.append(donchian_support)
-            sl = min(sl_options)
+                sl = donchian_support
+            else:
+                sl = min(sl_options)
 
             target_options = [3 * atr_value]
             if donchian_resistance is not None:
