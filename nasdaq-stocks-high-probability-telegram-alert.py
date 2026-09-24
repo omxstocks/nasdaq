@@ -336,7 +336,7 @@ def main():
                 print(f"\n📱 Sending Telegram alert...")
                 # Build Telegram message with table format
                 telegram_msg = "<code>\n"
-                telegram_msg += f"{'Date':<11} {'Sym':<5} {'Entry':>9} {'SL':>9} {'Target':>9} {'Shares':>7} {'Reward':>9} {'Conv':>5}\n"
+                telegram_msg += f"{'Date':<11} {'Sym':<5} {'Entry':>9} {'SL':>9} {'Target':>9} {'Shares':>7} {'Conv':>5} {'Reward':>9} \n"
                 telegram_msg += "─" * 75 + "\n"
 
                 for _, row in filtered_data.sort_values('symbol').iterrows():
@@ -364,7 +364,7 @@ def main():
                         else:
                             signal = "🟢"
 
-                        telegram_msg += f"{str(date):<11} {symbol:<5} {entry:>9.2f} {sl:>9.2f} {target:>9.2f} {shares:>7.0f} {rr_ratio:>6.2f} {str(conviction):>5}% {signal}\n"
+                        telegram_msg += f"{str(date):<11} {symbol:<5} {entry:>9.2f} {sl:>9.2f} {target:>9.2f} {shares:>7.0f} {str(conviction):>5}% {rr_ratio:>6.2f} {signal}\n"
 
                 telegram_msg += "</code>"
 
