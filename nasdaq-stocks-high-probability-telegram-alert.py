@@ -127,6 +127,13 @@ def calculate_position_sizing(close_price, atr_value, ema21_pct=None):
 
 
 def send_telegram_alert(bot_token, chat_id, message):
+
+    """Log message that we send to telegram."""
+    print(f"{'='*118}")
+    print(f"{message}")
+    print(f"{'='*118}")
+   
+
     """Send alert message to Telegram."""
     if not bot_token or not chat_id:
         return False
@@ -325,14 +332,15 @@ def main():
             print(f"{'='*118}")
 
             # Send Telegram alert if credentials provided in environment variables
-            if BOT_TOKEN and CHANNEL_ID and total_records > 0:
+            if total_records > 0:
                 print(f"\n📱 Sending Telegram alert...")
-                # Build Telegram message
-                telegram_msg = f"<b>🚀 NASDAQ High-Conviction Alerts - {display_date}</b>\n"
-                telegram_msg += f"<b>Capital: ${CAPITAL} | Risk: ${MAX_RISK_PER_TRADE} (2%) | R:R: 1:{RISK_REWARD_RATIO}</b>\n"
-                telegram_msg += f"<b>Records: {total_records}/{total_before_filter} | Shares: {total_shares:.0f}</b>\n\n"
+                # Build Telegram message with table format
+                telegram_msg = "<code>\n"
+                telegram_msg += f"{'Date':<11} {'Sym':<5} {'Entry':>9} {'SL':>9} {'Target':>9} {'Shares':>7} {'Reward':>9} {'Conv':>5}\n"
+                telegram_msg += "─" * 75 + "\n"
 
                 for _, row in filtered_data.sort_values('symbol').iterrows():
+                    date = row.get('date_time', 'N/A')
                     symbol = row.get('symbol', 'N/A')
                     close = row.get('close', 'N/A')
                     atr = row.get('atr_9', '')
@@ -343,10 +351,22 @@ def main():
                     position_info = calculate_position_sizing(close, atr, ema21_pct)
                     if position_info:
                         rr_ratio = position_info['actual_rr_ratio']
-                        telegram_msg += f"<b>{symbol}</b> (R:R {rr_ratio:.2f}:1)\n"
-                        telegram_msg += f"  Entry: {position_info['entry']:.2f} {CURRENCY_SYMBOL} | SL: {position_info['sl']:.2f} {CURRENCY_SYMBOL} | Target: {position_info['target']:.2f} {CURRENCY_SYMBOL}\n"
-                        telegram_msg += f"  Shares: {position_info['num_shares']:.0f} | Conv: {conviction}%\n"
-                        telegram_msg += f"  Risk: {position_info['risk_amount']:.0f} {CURRENCY_SYMBOL} | Reward: {position_info['reward_amount']:.0f} {CURRENCY_SYMBOL}\n\n"
+                        shares = position_info['num_shares']
+                        entry = position_info['entry']
+                        sl = position_info['sl']
+                        target = position_info['target']
+
+                        # Add emoji indicator based on R:R ratio
+                        if rr_ratio < 1.5:
+                            signal = "🔴"
+                        elif rr_ratio < 2:
+                            signal = "🟡"
+                        else:
+                            signal = "🟢"
+
+                        telegram_msg += f"{str(date):<11} {symbol:<5} {entry:>9.2f} {sl:>9.2f} {target:>9.2f} {shares:>7.0f} {rr_ratio:>6.2f} {str(conviction):>5}% {signal}\n"
+
+                telegram_msg += "</code>"
 
                 send_telegram_alert(BOT_TOKEN, CHANNEL_ID, telegram_msg)
             elif BOT_TOKEN or CHANNEL_ID:
