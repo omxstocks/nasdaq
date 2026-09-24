@@ -8,6 +8,10 @@ def generate_market_semantics(
     volume_ratio,
     rsi_slope=0.0,
 ):
+    # Round numeric inputs to 2 decimal places for consistency
+    rsi_slope = round(rsi_slope, 2)
+    volume_ratio = round(volume_ratio, 2)
+
     # ==========================================
     # 1. VOLUME DESCRIPTION
     # ==========================================

@@ -52,8 +52,8 @@ def _fetch_single_stock_price_history(stock, from_date=None, to_date=None):
         return None
 
 
-def calculate_position_sizing(close_price, atr_value, ema21_pct=None):
-    """Calculate SL, Target, and position size based on ATR, EMA21, and risk parameters."""
+def calculate_position_sizing(close_price, atr_value, ema21_pct=None, ema50_pct=None, donchian_support=None, donchian_resistance=None):
+    """Calculate SL, Target, and position size based on ATR, EMA21, EMA50, and risk parameters."""
     try:
         close_price = float(str(close_price).replace(",", ""))
         atr_value = float(str(atr_value).replace(",", ""))
@@ -69,24 +69,59 @@ def calculate_position_sizing(close_price, atr_value, ema21_pct=None):
             except (ValueError, TypeError):
                 pass
 
+        # Extract EMA50 price from percentage difference if available
+        ema50_price = None
+        if ema50_pct is not None:
+            try:
+                ema50_pct_value = float(str(ema50_pct).replace(",", "").replace("%", ""))
+                # ema50_pct is the percentage difference from close
+                # So: ema50_price = close_price / (1 + ema50_pct/100)
+                ema50_price = close_price / (1 + ema50_pct_value / 100)
+            except (ValueError, TypeError):
+                pass
+
         if atr_value <= 0 or close_price <= 0:
             return None
 
-        # Enhanced Stop Loss and Target calculations using EMA21
+        # Enhanced Stop Loss and Target calculations using EMA21, EMA50, and Donchian Channels
         if ema21_price is not None:
-            # SL = Min(close - 1.5*ATR, EMA21)
+            # SL options: close - 1.5*ATR, EMA21, or Donchian support
             sl_option1 = close_price - (1.5 * atr_value)
             sl_option2 = ema21_price
-            sl = min(sl_option1, sl_option2)
+            sl_options = [sl_option1, sl_option2]
 
-            # Target = Close + Max(1.5*(Close - EMA21), 1.5*ATR)
+            if donchian_support is not None:
+                sl_options.append(donchian_support)
+
+            sl = min(sl_options)
+
+            # Target options: EMA21-based, ATR-based, EMA50-based, or Donchian resistance
             target_option1 = close_price + (1.5 * (close_price - ema21_price))
-            target_option2 = close_price + (1.5 * atr_value)
-            target = close_price + max(target_option1 - close_price, target_option2 - close_price)
+            target_option2 = close_price + (3 * atr_value)
+            target_options = [target_option1 - close_price, target_option2 - close_price]
+
+            # Add option3 if EMA50 is available
+            if ema50_price is not None:
+                target_option3 = close_price + (1.5 * (close_price - ema50_price))
+                target_options.append(target_option3 - close_price)
+
+            # Add option4 if Donchian resistance is available
+            if donchian_resistance is not None:
+                target_option4 = donchian_resistance - close_price
+                target_options.append(target_option4)
+
+            target = close_price + max(target_options)
         else:
             # Fallback to ATR-only if EMA21 not available
-            sl = close_price - (1.5 * atr_value)
-            target = close_price + (1.5 * atr_value)
+            sl_options = [close_price - (1.5 * atr_value)]
+            if donchian_support is not None:
+                sl_options.append(donchian_support)
+            sl = min(sl_options)
+
+            target_options = [3 * atr_value]
+            if donchian_resistance is not None:
+                target_options.append(donchian_resistance - close_price)
+            target = close_price + max(target_options)
 
         # Position sizing based on actual SL distance
         # Risk per share = Close - SL
@@ -106,19 +141,19 @@ def calculate_position_sizing(close_price, atr_value, ema21_pct=None):
         target_distance = target - close_price
         reward_amount = target_distance * num_shares
 
-        # Calculate actual Risk:Reward ratio
-        actual_rr_ratio = target_distance / sl_distance if sl_distance > 0 else 0
+        # Calculate actual Risk:Reward ratio (to 2 decimal places)
+        actual_rr_ratio = round(target_distance / sl_distance, 2) if sl_distance > 0 else 0
 
         return {
-            "entry": close_price,
-            "sl": sl,
-            "target": target,
-            "sl_distance": sl_distance,
-            "target_distance": target_distance,
-            "position_size": position_size,
-            "num_shares": num_shares,
-            "risk_amount": risk_amount,
-            "reward_amount": reward_amount,
+            "entry": round(close_price, 2),
+            "sl": round(sl, 2),
+            "target": round(target, 2),
+            "sl_distance": round(sl_distance, 2),
+            "target_distance": round(target_distance, 2),
+            "position_size": round(position_size, 2),
+            "num_shares": round(num_shares, 2),
+            "risk_amount": round(risk_amount, 2),
+            "reward_amount": round(reward_amount, 2),
             "risk_reward_ratio": f"1:{RISK_REWARD_RATIO}",
             "actual_rr_ratio": actual_rr_ratio
         }
@@ -296,7 +331,7 @@ def main():
             print(f"\n📊 ENRICHED RECORDS FOR {display_date} (Min Conviction: {args.min_conviction}%)")
             print(f"💰 Risk Management: Capital={CAPITAL} {CURRENCY_SYMBOL} | Risk/Trade={MAX_RISK_PER_TRADE:.0f} {CURRENCY_SYMBOL} (2%) | R:R Ratio 1:{RISK_REWARD_RATIO}\n")
             print(f"Showing {total_records}/{total_before_filter} records (filtered {filtered_out} with conviction < {args.min_conviction}%)\n")
-            print(f"{'Date':<12} {'Symbol':<12} {'Entry':>10} {'SL':>10} {'Target':>10} {'Shares':>8} {'R:R':>6} {'Conv%':>6}")
+            print(f"{'Date':<12} {'Symbol':<12} {'Entry':>10} {'SL':>10} {'Target':>10} {'Shares':>8} {'Reward':>6} {'Conv%':>6} {'Rason'}")
             print("-" * 118)
 
             # Display records sorted by symbol with position sizing
@@ -307,17 +342,22 @@ def main():
                 close = row.get('close', 'N/A')
                 atr = row.get('atr_9', '')
                 ema21_pct = row.get('ema_21_pct', None)
+                ema50_pct = row.get('ema_50_pct', None)
+                donchian_support = row.get('donchian_support', None)
+                donchian_resistance = row.get('donchian_resistance', None)
                 conviction = row.get('buy_conviction_probability', 'N/A')
+                reason = row.get('buy_conviction_reason', 'N/A')
+
 
                 # Calculate position sizing
-                position_info = calculate_position_sizing(close, atr, ema21_pct)
+                position_info = calculate_position_sizing(close, atr, ema21_pct, ema50_pct, donchian_support, donchian_resistance)
 
                 if position_info:
                     num_shares = position_info['num_shares']
                     total_shares += num_shares
                     rr_ratio = position_info['actual_rr_ratio']
 
-                    print(f"{str(date):<12} {symbol:<12} {position_info['entry']:>10.2f} {position_info['sl']:>10.2f} {position_info['target']:>10.2f} {num_shares:>8.0f} {rr_ratio:>6.2f} {conviction:>6}%")
+                    print(f"{str(date):<12} {symbol:<12} {position_info['entry']:>10.2f} {position_info['sl']:>10.2f} {position_info['target']:>10.2f} {num_shares:>8.0f} {rr_ratio:>6.2f} {conviction:>6}% {reason}")
 
             # Export to CSV
             filepath = export_enriched_data_to_csv(price_history, args.to_date)
@@ -347,10 +387,13 @@ def main():
                     close = row.get('close', 'N/A')
                     atr = row.get('atr_9', '')
                     ema21_pct = row.get('ema_21_pct', None)
+                    ema50_pct = row.get('ema_50_pct', None)
+                    donchian_support = row.get('donchian_support', None)
+                    donchian_resistance = row.get('donchian_resistance', None)
                     conviction = row.get('buy_conviction_probability', 'N/A')
 
                     # Calculate position sizing
-                    position_info = calculate_position_sizing(close, atr, ema21_pct)
+                    position_info = calculate_position_sizing(close, atr, ema21_pct, ema50_pct, donchian_support, donchian_resistance)
                     if position_info:
                         rr_ratio = position_info['actual_rr_ratio']
                         shares = position_info['num_shares']

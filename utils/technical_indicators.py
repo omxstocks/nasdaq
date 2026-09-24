@@ -13,12 +13,12 @@ def calculate_rsi(closes, period):
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    rsi_values[period] = _rsi_from_averages(avg_gain, avg_loss)
+    rsi_values[period] = round(_rsi_from_averages(avg_gain, avg_loss), 2)
 
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rsi_values[i + 1] = _rsi_from_averages(avg_gain, avg_loss)
+        rsi_values[i + 1] = round(_rsi_from_averages(avg_gain, avg_loss), 2)
 
     return rsi_values
 
@@ -49,11 +49,11 @@ def calculate_atr(highs, lows, closes, period):
         true_ranges.append(true_range)
 
     atr = sum(true_ranges[:period]) / period
-    atr_values[period - 1] = atr
+    atr_values[period - 1] = round(atr, 2)
 
     for i in range(period, n):
         atr = (atr * (period - 1) + true_ranges[i]) / period
-        atr_values[i] = atr
+        atr_values[i] = round(atr, 2)
 
     return atr_values
 
@@ -76,6 +76,36 @@ def calculate_rsi_slope(rsi_values, period):
             continue
         y_mean = sum(window) / period
         numerator = sum(dx * (y - y_mean) for dx, y in zip(x_deviations, window))
-        slopes[i] = numerator / denominator
+        slopes[i] = round(numerator / denominator, 2)
 
     return slopes
+
+
+def calculate_donchian_channels(highs, lows, period=20):
+    """Calculate Donchian Channels (rolling support/resistance).
+
+    Returns upper and lower bands representing the highest high and lowest low
+    over the rolling period.
+
+    Args:
+        highs: List of high prices
+        lows: List of low prices
+        period: Rolling window period (default 20)
+
+    Returns:
+        tuple: (upper_band, lower_band) - lists of resistance and support values
+    """
+    n = len(highs)
+    upper_band = [None] * n
+    lower_band = [None] * n
+
+    if n < period:
+        return upper_band, lower_band
+
+    for i in range(period - 1, n):
+        window_highs = highs[i - period + 1: i + 1]
+        window_lows = lows[i - period + 1: i + 1]
+        upper_band[i] = round(max(window_highs), 2)
+        lower_band[i] = round(min(window_lows), 2)
+
+    return upper_band, lower_band

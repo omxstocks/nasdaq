@@ -2,7 +2,7 @@ from collections import deque
 
 from .calculate_probability import calculate_buy_conviction
 from .market_analysis import generate_market_semantics
-from .technical_indicators import calculate_atr, calculate_rsi, calculate_rsi_slope
+from .technical_indicators import calculate_atr, calculate_rsi, calculate_rsi_slope, calculate_donchian_channels
 
 EMA_PERIODS = [2, 5, 9, 14, 21, 50, 55, 100, 200]
 EMA_COLUMNS = {period: f"ema_{period}_pct" for period in EMA_PERIODS}
@@ -12,6 +12,10 @@ RSI_ATR_PERIODS = [9, 13, 21]
 RSI_COLUMNS = {period: f"rsi_{period}" for period in RSI_ATR_PERIODS}
 ATR_COLUMNS = {period: f"atr_{period}" for period in RSI_ATR_PERIODS}
 RSI_SLOPE_COLUMNS = {period: f"rsi_slope_{period}" for period in RSI_ATR_PERIODS}
+
+DONCHIAN_PERIOD = 20
+DONCHIAN_RESISTANCE = "donchian_resistance"
+DONCHIAN_SUPPORT = "donchian_support"
 
 # rsi_slope_9/rsi_9 feed market-semantics and buy-conviction generation, matching the
 # fastest EMA (ema_9) used there
@@ -80,6 +84,9 @@ def _compute_batch_indicators(valid_rows, combined_closes, combined_highs, combi
             combined_lows.append(low_price)
             combined_targets.append(row)
 
+    # Calculate Donchian Channels (support/resistance)
+    upper_band, lower_band = calculate_donchian_channels(combined_highs, combined_lows, DONCHIAN_PERIOD)
+
     for period in RSI_ATR_PERIODS:
         rsi_series = calculate_rsi(combined_closes, period)
         atr_series = calculate_atr(combined_highs, combined_lows, combined_closes, period)
@@ -88,11 +95,18 @@ def _compute_batch_indicators(valid_rows, combined_closes, combined_highs, combi
             if target is None:
                 continue
             target[RSI_COLUMNS[period]] = f"{rsi_value:.2f}" if rsi_value is not None else ""
-            target[ATR_COLUMNS[period]] = f"{atr_value:.4f}" if atr_value is not None else ""
-            target[RSI_SLOPE_COLUMNS[period]] = f"{rsi_slope_value:.4f}" if rsi_slope_value is not None else ""
+            target[ATR_COLUMNS[period]] = f"{atr_value:.2f}" if atr_value is not None else ""
+            target[RSI_SLOPE_COLUMNS[period]] = f"{rsi_slope_value:.2f}" if rsi_slope_value is not None else ""
             if period == MARKET_SEMANTICS_RSI_SLOPE_PERIOD:
                 target["_raw_rsi_slope"] = rsi_slope_value
                 target["_raw_rsi"] = rsi_value
+
+    # Add Donchian channel values to each row
+    for target, resistance, support in zip(combined_targets, upper_band, lower_band):
+        if target is None:
+            continue
+        target[DONCHIAN_RESISTANCE] = resistance
+        target[DONCHIAN_SUPPORT] = support
 
 
 def enrich_price_action_rows(valid_rows, history):
@@ -121,7 +135,7 @@ def enrich_price_action_rows(valid_rows, history):
             if open_price != 0:
                 percentage_change = f"{(change / open_price) * 100:+.2f}%"
 
-        previous_close = f"{last_close:.4f}" if last_close is not None else ""
+        previous_close = f"{last_close:.2f}" if last_close is not None else ""
         prev_close_pct_diff = ""
         if close_price is not None and last_close:
             prev_close_pct_diff = f"{((close_price - last_close) / last_close) * 100:+.2f}%"
@@ -143,7 +157,7 @@ def enrich_price_action_rows(valid_rows, history):
             avg_volume = sum(volume_window) / len(volume_window)
             if avg_volume:
                 raw_volume_ratio = volume / avg_volume
-                volume_avg_ratio = f"{raw_volume_ratio:.4f}"
+                volume_avg_ratio = f"{raw_volume_ratio:.2f}"
 
         market_semantics = {}
         buy_conviction = {}

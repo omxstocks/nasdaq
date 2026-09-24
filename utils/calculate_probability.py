@@ -10,6 +10,11 @@ def calculate_buy_conviction(rsi, vol, slope, conf):
     Returns:
         dict: Contains probability_percent and reason breakdown.
     """
+    # Round numeric inputs to 2 decimal places for consistency
+    rsi = round(rsi, 2)
+    vol = round(vol, 2)
+    slope = round(slope, 2)
+
     conf = conf or ""
     score = 0
     reason_parts = []
