@@ -52,41 +52,75 @@ def _fetch_single_stock_price_history(stock, from_date=None, to_date=None):
         return None
 
 
-def calculate_position_sizing(close_price, atr_value):
-    """Calculate SL, Target, and position size based on ATR and risk parameters."""
+def calculate_position_sizing(close_price, atr_value, ema21_pct=None):
+    """Calculate SL, Target, and position size based on ATR, EMA21, and risk parameters."""
     try:
         close_price = float(str(close_price).replace(",", ""))
         atr_value = float(str(atr_value).replace(",", ""))
 
+        # Extract EMA21 price from percentage difference if available
+        ema21_price = None
+        if ema21_pct is not None:
+            try:
+                ema21_pct_value = float(str(ema21_pct).replace(",", "").replace("%", ""))
+                # ema21_pct is the percentage difference from close
+                # So: ema21_price = close_price / (1 + ema21_pct/100)
+                ema21_price = close_price / (1 + ema21_pct_value / 100)
+            except (ValueError, TypeError):
+                pass
+
         if atr_value <= 0 or close_price <= 0:
             return None
 
-        # Stop Loss and Target based on ATR
-        sl = close_price - atr_value
-        target = close_price + (atr_value * RISK_REWARD_RATIO)
+        # Enhanced Stop Loss and Target calculations using EMA21
+        if ema21_price is not None:
+            # SL = Min(close - 1.5*ATR, EMA21)
+            sl_option1 = close_price - (1.5 * atr_value)
+            sl_option2 = ema21_price
+            sl = min(sl_option1, sl_option2)
 
-        # Position sizing based on risk
-        # Number of shares = Max Risk per Trade / Risk per share (ATR)
-        num_shares = MAX_RISK_PER_TRADE / atr_value
+            # Target = Close + Max(1.5*(Close - EMA21), 1.5*ATR)
+            target_option1 = close_price + (1.5 * (close_price - ema21_price))
+            target_option2 = close_price + (1.5 * atr_value)
+            target = close_price + max(target_option1 - close_price, target_option2 - close_price)
+        else:
+            # Fallback to ATR-only if EMA21 not available
+            sl = close_price - (1.5 * atr_value)
+            target = close_price + (1.5 * atr_value)
 
-        # Position size in dollars
+        # Position sizing based on actual SL distance
+        # Risk per share = Close - SL
+        sl_distance = close_price - sl
+
+        if sl_distance <= 0:
+            return None
+
+        # Number of shares = Max Risk per Trade / Risk per share (SL distance)
+        num_shares = MAX_RISK_PER_TRADE / sl_distance
+
+        # Position size in currency
         position_size = num_shares * close_price
 
         # Realized profit/loss at target and SL
-        risk_amount = atr_value * num_shares
-        reward_amount = (target - close_price) * num_shares
+        risk_amount = sl_distance * num_shares
+        target_distance = target - close_price
+        reward_amount = target_distance * num_shares
+
+        # Calculate actual Risk:Reward ratio
+        actual_rr_ratio = target_distance / sl_distance if sl_distance > 0 else 0
 
         return {
             "entry": close_price,
             "sl": sl,
             "target": target,
-            "sl_distance": atr_value,
-            "target_distance": atr_value * RISK_REWARD_RATIO,
+            "sl_distance": sl_distance,
+            "target_distance": target_distance,
             "position_size": position_size,
             "num_shares": num_shares,
             "risk_amount": risk_amount,
             "reward_amount": reward_amount,
-            "risk_reward_ratio": f"1:{RISK_REWARD_RATIO}"
+            "risk_reward_ratio": f"1:{RISK_REWARD_RATIO}",
+            "actual_rr_ratio": actual_rr_ratio
         }
     except (ValueError, TypeError, ZeroDivisionError):
         return None
@@ -255,7 +289,7 @@ def main():
             print(f"\n📊 ENRICHED RECORDS FOR {display_date} (Min Conviction: {args.min_conviction}%)")
             print(f"💰 Risk Management: Capital={CAPITAL} {CURRENCY_SYMBOL} | Risk/Trade={MAX_RISK_PER_TRADE:.0f} {CURRENCY_SYMBOL} (2%) | R:R Ratio 1:{RISK_REWARD_RATIO}\n")
             print(f"Showing {total_records}/{total_before_filter} records (filtered {filtered_out} with conviction < {args.min_conviction}%)\n")
-            print(f"{'Date':<12} {'Symbol':<12} {'Entry':>10} {'SL':>10} {'Target':>10} {'Shares':>8} {'Conv%':>6} {'ATR':>8}")
+            print(f"{'Date':<12} {'Symbol':<12} {'Entry':>10} {'SL':>10} {'Target':>10} {'Shares':>8} {'R:R':>6} {'Conv%':>6}")
             print("-" * 118)
 
             # Display records sorted by symbol with position sizing
@@ -265,16 +299,18 @@ def main():
                 symbol = row.get('symbol', 'N/A')
                 close = row.get('close', 'N/A')
                 atr = row.get('atr_9', '')
+                ema21_pct = row.get('ema_21_pct', None)
                 conviction = row.get('buy_conviction_probability', 'N/A')
 
                 # Calculate position sizing
-                position_info = calculate_position_sizing(close, atr)
+                position_info = calculate_position_sizing(close, atr, ema21_pct)
 
                 if position_info:
                     num_shares = position_info['num_shares']
                     total_shares += num_shares
+                    rr_ratio = position_info['actual_rr_ratio']
 
-                    print(f"{str(date):<12} {symbol:<12} {position_info['entry']:>10.2f} {position_info['sl']:>10.2f} {position_info['target']:>10.2f} {num_shares:>8.0f} {conviction:>6}% {position_info['sl_distance']:>8.2f}")
+                    print(f"{str(date):<12} {symbol:<12} {position_info['entry']:>10.2f} {position_info['sl']:>10.2f} {position_info['target']:>10.2f} {num_shares:>8.0f} {rr_ratio:>6.2f} {conviction:>6}%")
 
             # Export to CSV
             filepath = export_enriched_data_to_csv(price_history, args.to_date)
@@ -300,15 +336,17 @@ def main():
                     symbol = row.get('symbol', 'N/A')
                     close = row.get('close', 'N/A')
                     atr = row.get('atr_9', '')
+                    ema21_pct = row.get('ema_21_pct', None)
                     conviction = row.get('buy_conviction_probability', 'N/A')
 
                     # Calculate position sizing
-                    position_info = calculate_position_sizing(close, atr)
+                    position_info = calculate_position_sizing(close, atr, ema21_pct)
                     if position_info:
-                        telegram_msg += f"<b>{symbol}</b>\n"
-                        telegram_msg += f"  Entry: {position_info['entry']:.2f} | SL: {position_info['sl']:.2f} | Target: {position_info['target']:.2f}\n"
+                        rr_ratio = position_info['actual_rr_ratio']
+                        telegram_msg += f"<b>{symbol}</b> (R:R {rr_ratio:.2f}:1)\n"
+                        telegram_msg += f"  Entry: {position_info['entry']:.2f} {CURRENCY_SYMBOL} | SL: {position_info['sl']:.2f} {CURRENCY_SYMBOL} | Target: {position_info['target']:.2f} {CURRENCY_SYMBOL}\n"
                         telegram_msg += f"  Shares: {position_info['num_shares']:.0f} | Conv: {conviction}%\n"
-                        telegram_msg += f"  Risk: ${position_info['risk_amount']:.2f} | Reward: ${position_info['reward_amount']:.2f}\n\n"
+                        telegram_msg += f"  Risk: {position_info['risk_amount']:.0f} {CURRENCY_SYMBOL} | Reward: {position_info['reward_amount']:.0f} {CURRENCY_SYMBOL}\n\n"
 
                 send_telegram_alert(BOT_TOKEN, CHANNEL_ID, telegram_msg)
             elif BOT_TOKEN or CHANNEL_ID:
