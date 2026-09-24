@@ -335,7 +335,9 @@ def main():
             if total_records > 0:
                 print(f"\n📱 Sending Telegram alert...")
                 # Build Telegram message with table format
-                telegram_msg = "<code>\n"
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                telegram_msg = f"<b>🚀 NASDAQ Alerts - {current_time}</b>\n\n"
+                telegram_msg += "<code>\n"
                 telegram_msg += f"{'Date':<11} {'Sym':<5} {'Entry':>9} {'SL':>9} {'Target':>9} {'Shares':>7} {'Conv':>5} {'Reward':>9} \n"
                 telegram_msg += "─" * 75 + "\n"
 
