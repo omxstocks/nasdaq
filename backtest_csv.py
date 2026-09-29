@@ -245,7 +245,14 @@ def backtest(csv_file):
     print(f"Total P&L %:         {total_pnl_pct:+.2f}%")
     print(f"Average Win %:       {avg_win:+.2f}%")
     print(f"Average Loss %:      {avg_loss:+.2f}%")
-    print(f"Profit Factor:       {abs(sum(r['pnl_pct'] for r in results if r['pnl_pct'] > 0) / sum(r['pnl_pct'] for r in results if r['pnl_pct'] < 0)) if losing_trades > 0 else 'N/A':.2f}")
+
+    # Calculate profit factor
+    if losing_trades > 0:
+        profit_factor = abs(sum(r['pnl_pct'] for r in results if r['pnl_pct'] > 0) / sum(r['pnl_pct'] for r in results if r['pnl_pct'] < 0))
+        print(f"Profit Factor:       {profit_factor:.2f}")
+    else:
+        print(f"Profit Factor:       N/A (no losing trades)")
+
     print("=" * 100)
 
 
