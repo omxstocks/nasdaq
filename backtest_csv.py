@@ -41,14 +41,31 @@ def read_csv(csv_file):
 
         with open(csv_file, 'r') as f:
             reader = csv.DictReader(f, delimiter=delimiter)
-            for row in reader:
-                trades.append({
-                    'ticker': row['ticker'].strip(),
-                    'date': row['date'].strip(),
-                    'entry': float(row['entry'].strip()),
-                    'sl': float(row['sl'].strip()),
-                    'target': float(row['target'].strip())
-                })
+            for row_num, row in enumerate(reader, start=2):  # Start at 2 because header is row 1
+                try:
+                    # Trim and validate all fields
+                    ticker = row['ticker'].strip() if row['ticker'] else None
+                    date = row['date'].strip() if row['date'] else None
+                    entry_str = row['entry'].strip() if row['entry'] else None
+                    sl_str = row['sl'].strip() if row['sl'] else None
+                    target_str = row['target'].strip() if row['target'] else None
+
+                    # Skip row if any required field is empty
+                    if not all([ticker, date, entry_str, sl_str, target_str]):
+                        print(f"⚠️  Skipping row {row_num}: missing or empty field(s)")
+                        continue
+
+                    trades.append({
+                        'ticker': ticker,
+                        'date': date,
+                        'entry': float(entry_str),
+                        'sl': float(sl_str),
+                        'target': float(target_str)
+                    })
+                except (ValueError, TypeError) as e:
+                    print(f"⚠️  Skipping row {row_num}: invalid data - {e}")
+                    continue
+
         # Sort by date ascending
         trades.sort(key=lambda x: x['date'])
         return trades
@@ -117,6 +134,15 @@ def process_trade(trade, price_data):
 
     if not price_data_from_entry:
         return None
+
+    # Validate entry: entry_price must be >= low price of next trading day
+    # This simulates a "Good Till" order placed in evening for next day
+    # If entry_price < low of next day, the order won't be filled
+    if len(price_data_from_entry) > 0:
+        next_day_low = float(str(price_data_from_entry[0]['low']).replace(',', ''))
+        if entry_price < next_day_low:
+            # Entry price is too low; order cannot be filled at that price
+            return None
 
     # Track for up to 21 trading days
     exit_price = None
@@ -218,6 +244,10 @@ def backtest(csv_file):
 
     # Process each trade
     results = []
+    skipped_trades = []
+    skipped_entry_validation = 0
+    skipped_no_data = 0
+
     for trade in trades:
         ticker = trade['ticker']
         entry_date = trade['date']
@@ -232,17 +262,50 @@ def backtest(csv_file):
         price_data = fetch_price_data(ticker, entry_date, end_date)
 
         if not price_data:
-            print(f"⚠️  No price data for {ticker} on {entry_date}")
+            skipped_trades.append({
+                'entry_date': entry_date,
+                'ticker': ticker,
+                'entry': trade['entry'],
+                'sl': trade['sl'],
+                'target': trade['target'],
+                'skip_reason': 'NO_PRICE_DATA'
+            })
+            skipped_no_data += 1
             continue
 
         # Process trade (will count trading days from price_action table)
         result = process_trade(trade, price_data)
         if result:
             results.append(result)
+        else:
+            # Trade was skipped due to entry validation (entry_price < next_day_low)
+            if len(price_data) > 0:
+                next_day_low = float(str(price_data[0]['low']).replace(',', ''))
+                skip_reason = f'ENTRY_TOO_LOW (Entry: {trade["entry"]:.2f} < Next Low: {next_day_low:.2f})'
+            else:
+                skip_reason = 'ENTRY_TOO_LOW'
+
+            skipped_trades.append({
+                'entry_date': entry_date,
+                'ticker': ticker,
+                'entry': trade['entry'],
+                'sl': trade['sl'],
+                'target': trade['target'],
+                'skip_reason': skip_reason
+            })
+            skipped_entry_validation += 1
 
     if not results:
         print("No trades completed")
         return
+
+    # Display entry validation summary
+    print(f"\n📊 ENTRY VALIDATION SUMMARY")
+    print(f"Total trades loaded:          {len(trades)}")
+    print(f"Trades that passed entry validation (filled): {len(results)}")
+    print(f"Trades skipped (entry price too low):         {skipped_entry_validation}")
+    print(f"Trades skipped (no price data):               {skipped_no_data}")
+    print(f"Pass rate: {len(results)/len(trades)*100:.1f}%\n")
 
     # Sort results by entry date in ascending order
     results.sort(key=lambda x: x['entry_date'])
@@ -300,6 +363,18 @@ def backtest(csv_file):
         print(f"{year:<8} {stats['trades']:>8} {stats['winning']:>10} {stats['losing']:>10} {stats['breakeven']:>10} {win_rate:>11.1f}% {pnl_symbol}{stats['total_pnl']:>11.2f}% {avg_win:>11.2f}% {avg_loss:>11.2f}%")
 
     print("=" * 110)
+
+    # Display skipped trades if any
+    if skipped_trades:
+        print(f"\n❌ SKIPPED TRADES ({len(skipped_trades)} total)")
+        print("=" * 130)
+        print(f"{'Entry Date':<12} {'Ticker':<8} {'Entry':>10} {'SL':>10} {'Target':>10} {'Skip Reason':<80}")
+        print("-" * 130)
+
+        for trade in sorted(skipped_trades, key=lambda x: x['entry_date']):
+            print(f"{trade['entry_date']:<12} {trade['ticker']:<8} {trade['entry']:>10.2f} {trade['sl']:>10.2f} {trade['target']:>10.2f} {trade['skip_reason']:<80}")
+
+        print("=" * 130)
 
     # Calculate summary statistics
     total_pnl_pct = sum(r['pnl_pct'] for r in results)
