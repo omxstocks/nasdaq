@@ -7,19 +7,47 @@ from pathlib import Path
 DB_PATH = Path(__file__).parent / "data" / "nasdaq_nordic.db"
 
 
-def read_csv(csv_file):
-    """Read CSV file and return list of trades."""
-    trades = []
+def detect_delimiter(csv_file):
+    """Detect the delimiter used in the CSV file (comma, tab, or space)."""
     try:
         with open(csv_file, 'r') as f:
-            reader = csv.DictReader(f)
+            first_line = f.readline().strip()
+
+        # Count occurrences of each potential delimiter
+        comma_count = first_line.count(',')
+        tab_count = first_line.count('\t')
+        space_count = first_line.count(' ')
+
+        # Return the most likely delimiter based on counts
+        if tab_count > 0 and tab_count >= comma_count:
+            return '\t'
+        elif comma_count > 0:
+            return ','
+        elif space_count > 0:
+            return ' '
+        else:
+            return ','  # Default to comma
+    except Exception as e:
+        print(f"Warning: Could not detect delimiter, using comma: {e}")
+        return ','
+
+
+def read_csv(csv_file):
+    """Read CSV file (supports comma, tab, and space delimiters) and return list of trades."""
+    trades = []
+    try:
+        # Detect the delimiter automatically
+        delimiter = detect_delimiter(csv_file)
+
+        with open(csv_file, 'r') as f:
+            reader = csv.DictReader(f, delimiter=delimiter)
             for row in reader:
                 trades.append({
-                    'ticker': row['ticker'],
-                    'date': row['date'],
-                    'entry': float(row['entry']),
-                    'sl': float(row['sl']),
-                    'target': float(row['target'])
+                    'ticker': row['ticker'].strip(),
+                    'date': row['date'].strip(),
+                    'entry': float(row['entry'].strip()),
+                    'sl': float(row['sl'].strip()),
+                    'target': float(row['target'].strip())
                 })
         # Sort by date ascending
         trades.sort(key=lambda x: x['date'])
