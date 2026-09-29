@@ -86,7 +86,10 @@ def fetch_price_data(ticker, start_date, end_date):
 
 
 def process_trade(trade, price_data):
-    """Process a single trade for up to 20 days.
+    """Process a single trade for up to 21 trading days (from price_action table).
+
+    Note: Uses actual trading days from price_action table, not calendar days.
+    This accounts for weekends and market holidays automatically.
 
     Returns:
         {
@@ -98,7 +101,7 @@ def process_trade(trade, price_data):
             'exit_reason': 'TARGET' | 'SL' | 'TIMEOUT',
             'pnl': float,
             'pnl_pct': float,
-            'days_held': int
+            'days_held': int (trading days, not calendar days)
         }
     """
     entry_date = trade['date']
@@ -115,17 +118,17 @@ def process_trade(trade, price_data):
     if not price_data_from_entry:
         return None
 
-    # Track for up to 20 days
+    # Track for up to 21 trading days
     exit_price = None
     exit_date = None
     exit_reason = None
-    days_held = 0
+    trading_days_held = 0
 
     for idx, price_point in enumerate(price_data_from_entry):
         current_date = price_point['date_time'].split()[0]
         current_close = float(str(price_point['close']).replace(',', ''))
 
-        days_held = idx
+        trading_days_held = idx + 1  # 1-indexed: day 1, day 2, etc.
 
         # Check if target is hit (using close price)
         if current_close >= target:
@@ -141,8 +144,8 @@ def process_trade(trade, price_data):
             exit_reason = 'SL'
             break
 
-        # Check if 20 days have passed (including entry date as day 1)
-        if idx >= 19:  # 0-indexed, so 19 means 20 days
+        # Check if 21 trading days have passed (counting actual trading days from price_action table)
+        if idx >= 20:  # 0-indexed, so 20 means 21st trading day
             exit_price = current_close
             exit_date = current_date
             exit_reason = 'TIMEOUT'
@@ -153,6 +156,7 @@ def process_trade(trade, price_data):
         exit_price = float(str(price_data_from_entry[-1]['close']).replace(',', ''))
         exit_date = price_data_from_entry[-1]['date_time'].split()[0]
         exit_reason = 'TIMEOUT'
+        trading_days_held = len(price_data_from_entry)
 
     # Calculate P&L
     pnl = exit_price - entry_price
@@ -169,7 +173,7 @@ def process_trade(trade, price_data):
         'exit_reason': exit_reason,
         'pnl': round(pnl, 2),
         'pnl_pct': round(pnl_pct, 2),
-        'days_held': days_held
+        'days_held': trading_days_held
     }
 
 
@@ -218,9 +222,10 @@ def backtest(csv_file):
         ticker = trade['ticker']
         entry_date = trade['date']
 
-        # Calculate end date (20 days after entry)
+        # Fetch price data from entry date onwards (fetch much more to get 21 trading days)
+        # We fetch 60 calendar days to be safe, as it should cover 21 trading days
         entry_dt = datetime.strptime(entry_date, "%Y-%m-%d")
-        end_dt = entry_dt + timedelta(days=20)
+        end_dt = entry_dt + timedelta(days=60)  # Fetch 60 calendar days to ensure we get 21 trading days
         end_date = end_dt.strftime("%Y-%m-%d")
 
         # Fetch price data
@@ -230,7 +235,7 @@ def backtest(csv_file):
             print(f"⚠️  No price data for {ticker} on {entry_date}")
             continue
 
-        # Process trade
+        # Process trade (will count trading days from price_action table)
         result = process_trade(trade, price_data)
         if result:
             results.append(result)
@@ -249,6 +254,52 @@ def backtest(csv_file):
     for result in results:
         p_l_symbol = "+" if result['pnl_pct'] >= 0 else ""
         print(f"{result['entry_date']:<12} {result['exit_date']:<12} {result['ticker']:<8} {result['entry_price']:>10.2f} {result['sl']:>10.2f} {result['target']:>10.2f} {result['exit_price']:>10.2f} {result['exit_reason']:<10} {p_l_symbol}{result['pnl_pct']:>7.2f}% {result['days_held']:>5}")
+
+    # Year-wise P&L Analysis
+    year_stats = {}
+    for result in results:
+        year = result['exit_date'][:4]  # Extract year from exit_date
+
+        if year not in year_stats:
+            year_stats[year] = {
+                'trades': 0,
+                'winning': 0,
+                'losing': 0,
+                'breakeven': 0,
+                'total_pnl': 0,
+                'win_pnl': 0,
+                'loss_pnl': 0
+            }
+
+        year_stats[year]['trades'] += 1
+        year_stats[year]['total_pnl'] += result['pnl_pct']
+
+        if result['pnl_pct'] > 0:
+            year_stats[year]['winning'] += 1
+            year_stats[year]['win_pnl'] += result['pnl_pct']
+        elif result['pnl_pct'] < 0:
+            year_stats[year]['losing'] += 1
+            year_stats[year]['loss_pnl'] += result['pnl_pct']
+        else:
+            year_stats[year]['breakeven'] += 1
+
+    # Display Year-wise P&L
+    print("\n" + "=" * 110)
+    print("📊 YEAR-WISE P&L STATEMENT")
+    print("=" * 110)
+    print(f"{'Year':<8} {'Trades':>8} {'Winning':>10} {'Losing':>10} {'Breakeven':>10} {'Win Rate':>12} {'Total P&L %':>12} {'Avg Win %':>12} {'Avg Loss %':>12}")
+    print("-" * 110)
+
+    for year in sorted(year_stats.keys()):
+        stats = year_stats[year]
+        win_rate = (stats['winning'] / stats['trades'] * 100) if stats['trades'] > 0 else 0
+        avg_win = (stats['win_pnl'] / stats['winning']) if stats['winning'] > 0 else 0
+        avg_loss = (stats['loss_pnl'] / stats['losing']) if stats['losing'] > 0 else 0
+
+        pnl_symbol = "+" if stats['total_pnl'] >= 0 else ""
+        print(f"{year:<8} {stats['trades']:>8} {stats['winning']:>10} {stats['losing']:>10} {stats['breakeven']:>10} {win_rate:>11.1f}% {pnl_symbol}{stats['total_pnl']:>11.2f}% {avg_win:>11.2f}% {avg_loss:>11.2f}%")
+
+    print("=" * 110)
 
     # Calculate summary statistics
     total_pnl_pct = sum(r['pnl_pct'] for r in results)
