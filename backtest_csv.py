@@ -1,0 +1,272 @@
+import argparse
+import csv
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DB_PATH = Path(__file__).parent / "data" / "nasdaq_nordic.db"
+
+
+def read_csv(csv_file):
+    """Read CSV file and return list of trades."""
+    trades = []
+    try:
+        with open(csv_file, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                trades.append({
+                    'ticker': row['ticker'],
+                    'date': row['date'],
+                    'entry': float(row['entry']),
+                    'sl': float(row['sl']),
+                    'target': float(row['target'])
+                })
+        # Sort by date ascending
+        trades.sort(key=lambda x: x['date'])
+        return trades
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return []
+
+
+def fetch_price_data(ticker, start_date, end_date):
+    """Fetch daily price data for a stock between dates."""
+    if not DB_PATH.exists():
+        print(f"Database not found at {DB_PATH}")
+        return []
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        query = """
+            SELECT date_time, close, high, low
+            FROM price_action
+            WHERE symbol = ? AND date(date_time) >= ? AND date(date_time) <= ?
+            ORDER BY date_time ASC
+        """
+
+        cursor.execute(query, (ticker, start_date, end_date))
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"Error fetching price data for {ticker}: {e}")
+        return []
+
+
+def process_trade(trade, price_data):
+    """Process a single trade for up to 20 days.
+
+    Returns:
+        {
+            'ticker': str,
+            'entry_date': str,
+            'entry_price': float,
+            'exit_date': str,
+            'exit_price': float,
+            'exit_reason': 'TARGET' | 'SL' | 'TIMEOUT',
+            'pnl': float,
+            'pnl_pct': float,
+            'days_held': int
+        }
+    """
+    entry_date = trade['date']
+    entry_price = trade['entry']
+    sl = trade['sl']
+    target = trade['target']
+
+    if not price_data:
+        return None
+
+    # Filter price data from entry date onwards
+    price_data_from_entry = [p for p in price_data if p['date_time'].split()[0] >= entry_date]
+
+    if not price_data_from_entry:
+        return None
+
+    # Track for up to 20 days
+    exit_price = None
+    exit_date = None
+    exit_reason = None
+    days_held = 0
+
+    for idx, price_point in enumerate(price_data_from_entry):
+        current_date = price_point['date_time'].split()[0]
+        current_close = float(str(price_point['close']).replace(',', ''))
+
+        days_held = idx
+
+        # Check if target is hit (using close price)
+        if current_close >= target:
+            exit_price = target
+            exit_date = current_date
+            exit_reason = 'TARGET'
+            break
+
+        # Check if SL is hit (using close price)
+        if current_close <= sl:
+            exit_price = sl
+            exit_date = current_date
+            exit_reason = 'SL'
+            break
+
+        # Check if 20 days have passed (including entry date as day 1)
+        if idx >= 19:  # 0-indexed, so 19 means 20 days
+            exit_price = current_close
+            exit_date = current_date
+            exit_reason = 'TIMEOUT'
+            break
+
+    if exit_price is None:
+        # If we reach here, exit at last available price
+        exit_price = float(str(price_data_from_entry[-1]['close']).replace(',', ''))
+        exit_date = price_data_from_entry[-1]['date_time'].split()[0]
+        exit_reason = 'TIMEOUT'
+
+    # Calculate P&L
+    pnl = exit_price - entry_price
+    pnl_pct = (pnl / entry_price) * 100
+
+    return {
+        'ticker': trade['ticker'],
+        'entry_date': entry_date,
+        'entry_price': entry_price,
+        'sl': sl,
+        'target': target,
+        'exit_date': exit_date,
+        'exit_price': exit_price,
+        'exit_reason': exit_reason,
+        'pnl': round(pnl, 2),
+        'pnl_pct': round(pnl_pct, 2),
+        'days_held': days_held
+    }
+
+
+def merge_overlapping_trades(trades_with_results):
+    """Merge trades with overlapping 20-day periods for same ticker.
+
+    If multiple trades for same ticker overlap within 20 days:
+    - Average entry price and SL
+    - Take highest target
+    - Keep track of all exit results
+    """
+    if not trades_with_results:
+        return trades_with_results
+
+    # Group trades by ticker
+    trades_by_ticker = {}
+    for trade in trades_with_results:
+        ticker = trade['ticker']
+        if ticker not in trades_by_ticker:
+            trades_by_ticker[ticker] = []
+        trades_by_ticker[ticker].append(trade)
+
+    # For now, return as-is (individual trades)
+    # Advanced merging logic would go here if needed
+    return trades_with_results
+
+
+def backtest(csv_file):
+    """Run backtest on CSV trades."""
+    print("=" * 120)
+    print(f"📊 BACKTEST ANALYSIS - CSV: {csv_file}")
+    print("=" * 120)
+
+    # Read CSV
+    trades = read_csv(csv_file)
+    if not trades:
+        print("No trades found in CSV")
+        return
+
+    print(f"\nLoaded {len(trades)} trades from CSV")
+    print(f"Date range: {trades[0]['date']} to {trades[-1]['date']}\n")
+
+    # Process each trade
+    results = []
+    for trade in trades:
+        ticker = trade['ticker']
+        entry_date = trade['date']
+
+        # Calculate end date (20 days after entry)
+        entry_dt = datetime.strptime(entry_date, "%Y-%m-%d")
+        end_dt = entry_dt + timedelta(days=20)
+        end_date = end_dt.strftime("%Y-%m-%d")
+
+        # Fetch price data
+        price_data = fetch_price_data(ticker, entry_date, end_date)
+
+        if not price_data:
+            print(f"⚠️  No price data for {ticker} on {entry_date}")
+            continue
+
+        # Process trade
+        result = process_trade(trade, price_data)
+        if result:
+            results.append(result)
+
+    if not results:
+        print("No trades completed")
+        return
+
+    # Sort results by entry date in ascending order
+    results.sort(key=lambda x: x['entry_date'])
+
+    # Display results
+    print(f"\n{'Entry Date':<12} {'Exit Date':<12} {'Ticker':<8} {'Entry':>10} {'SL':>10} {'Target':>10} {'Exit':>10} {'Reason':<10} {'P&L %':>8} {'Days':>5}")
+    print("-" * 140)
+
+    for result in results:
+        p_l_symbol = "+" if result['pnl_pct'] >= 0 else ""
+        print(f"{result['entry_date']:<12} {result['exit_date']:<12} {result['ticker']:<8} {result['entry_price']:>10.2f} {result['sl']:>10.2f} {result['target']:>10.2f} {result['exit_price']:>10.2f} {result['exit_reason']:<10} {p_l_symbol}{result['pnl_pct']:>7.2f}% {result['days_held']:>5}")
+
+    # Calculate summary statistics
+    total_pnl_pct = sum(r['pnl_pct'] for r in results)
+    winning_trades = sum(1 for r in results if r['pnl_pct'] > 0)
+    losing_trades = sum(1 for r in results if r['pnl_pct'] < 0)
+    breakeven_trades = sum(1 for r in results if r['pnl_pct'] == 0)
+    total_trades = len(results)
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+
+    avg_win = sum(r['pnl_pct'] for r in results if r['pnl_pct'] > 0) / winning_trades if winning_trades > 0 else 0
+    avg_loss = sum(r['pnl_pct'] for r in results if r['pnl_pct'] < 0) / losing_trades if losing_trades > 0 else 0
+
+    # Display summary
+    print("\n" + "=" * 100)
+    print("📈 BACKTEST SUMMARY")
+    print("=" * 100)
+    print(f"Total Trades:        {total_trades}")
+    print(f"Winning Trades:      {winning_trades} ({winning_trades/total_trades*100:.1f}%)")
+    print(f"Losing Trades:       {losing_trades} ({losing_trades/total_trades*100:.1f}%)")
+    print(f"Breakeven Trades:    {breakeven_trades}")
+    print(f"\nWin Rate:            {win_rate:.2f}%")
+    print(f"Total P&L %:         {total_pnl_pct:+.2f}%")
+    print(f"Average Win %:       {avg_win:+.2f}%")
+    print(f"Average Loss %:      {avg_loss:+.2f}%")
+    print(f"Profit Factor:       {abs(sum(r['pnl_pct'] for r in results if r['pnl_pct'] > 0) / sum(r['pnl_pct'] for r in results if r['pnl_pct'] < 0)) if losing_trades > 0 else 'N/A':.2f}")
+    print("=" * 100)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Backtest trading strategy from CSV file"
+    )
+    parser.add_argument(
+        "csv_file",
+        type=str,
+        help="Path to CSV file with trades (ticker, date, entry, sl, target)",
+    )
+    args = parser.parse_args()
+
+    csv_path = Path(args.csv_file)
+    if not csv_path.exists():
+        print(f"CSV file not found: {csv_path}")
+        return
+
+    backtest(csv_path)
+
+
+if __name__ == "__main__":
+    main()
