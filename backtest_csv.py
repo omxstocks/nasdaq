@@ -4,7 +4,45 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
+'''
+-- UP-TREND RESULTS
+SELECT 
+    symbol AS ticker, 
+    date_time AS date,  
+    low AS entry, 
+    (donchian_support - adr_20) AS sl, 
+    ROUND((donchian_resistance + (donchian_resistance / 3.0)), 2) AS target,
+	DATE(date_time, '+28 days') AS target_date
+FROM price_action 
+WHERE symbol = 'ABB'  
+  AND date_time BETWEEN '2021-01-01' AND '2026-12-31'  
+  AND ema_21 > ema_50 
+  AND rvol_50 > 1.5
+
+UNION ALL
+
+-- DOWN TREND RESULTS
+SELECT 
+    symbol AS ticker, 
+    date_time AS date,  
+    low AS entry, 
+    (donchian_support - adr_20) AS sl, 
+    ROUND(donchian_resistance, 2) AS target ,
+	DATE(date_time, '+28 days') AS target_date
+FROM price_action 
+WHERE symbol = 'ABB'  
+  AND date_time BETWEEN '2021-01-01' AND '2026-12-31'  
+  AND ema_50 > ema_21  
+  AND rsi_14 < 40
+  AND rvol_50 > 1.5
+
+ORDER BY date ASC;
+
+'''
+
+
 DB_PATH = Path(__file__).parent / "data" / "nasdaq_nordic.db"
+
 
 
 def detect_delimiter(csv_file):
@@ -50,9 +88,15 @@ def read_csv(csv_file):
                     sl_str = row['sl'].strip() if row['sl'] else None
                     target_str = row['target'].strip() if row['target'] else None
 
+                    # Optional: target_date (custom exit date)
+                    target_date = None
+                    if 'target_date' in row:
+                        target_date_str = row['target_date'].strip() if row['target_date'] else None
+                        target_date = target_date_str if target_date_str else None
+
                     # Skip row if any required field is empty
                     if not all([ticker, date, entry_str, sl_str, target_str]):
-                        print(f"⚠️  Skipping row {row_num}: missing or empty field(s)")
+                        print(f"⚠️  Skipping row {row_num}: missing or empty required field(s)")
                         continue
 
                     trades.append({
@@ -60,7 +104,8 @@ def read_csv(csv_file):
                         'date': date,
                         'entry': float(entry_str),
                         'sl': float(sl_str),
-                        'target': float(target_str)
+                        'target': float(target_str),
+                        'target_date': target_date  # Optional column
                     })
                 except (ValueError, TypeError) as e:
                     print(f"⚠️  Skipping row {row_num}: invalid data - {e}")
@@ -105,6 +150,12 @@ def fetch_price_data(ticker, start_date, end_date):
 def process_trade(trade, price_data):
     """Process a single trade for up to 21 trading days (from price_action table).
 
+    Priority order for exits:
+    1. SL hit (Stop Loss takes priority over everything)
+    2. Target hit
+    3. Target date reached (if provided)
+    4. 21 trading days timeout (if no target date)
+
     Note: Uses actual trading days from price_action table, not calendar days.
     This accounts for weekends and market holidays automatically.
 
@@ -115,7 +166,7 @@ def process_trade(trade, price_data):
             'entry_price': float,
             'exit_date': str,
             'exit_price': float,
-            'exit_reason': 'TARGET' | 'SL' | 'TIMEOUT',
+            'exit_reason': 'TARGET' | 'SL' | 'TIMEOUT' | 'TARGET_DATE',
             'pnl': float,
             'pnl_pct': float,
             'days_held': int (trading days, not calendar days)
@@ -125,6 +176,7 @@ def process_trade(trade, price_data):
     entry_price = trade['entry']
     sl = trade['sl']
     target = trade['target']
+    target_date = trade.get('target_date')  # Optional: custom exit date
 
     if not price_data:
         return None
@@ -144,7 +196,7 @@ def process_trade(trade, price_data):
             # Entry price is too low; order cannot be filled at that price
             return None
 
-    # Track for up to 21 trading days
+    # Track for up to 21 trading days or until target_date
     exit_price = None
     exit_date = None
     exit_reason = None
@@ -153,25 +205,40 @@ def process_trade(trade, price_data):
     for idx, price_point in enumerate(price_data_from_entry):
         current_date = price_point['date_time'].split()[0]
         current_close = float(str(price_point['close']).replace(',', ''))
+        current_high = float(str(price_point['high']).replace(',', ''))
 
         trading_days_held = idx + 1  # 1-indexed: day 1, day 2, etc.
 
-        # Check if target is hit (using close price)
-        if current_close >= target:
-            exit_price = target
-            exit_date = current_date
-            exit_reason = 'TARGET'
-            break
-
-        # Check if SL is hit (using close price)
+        # PRIORITY 1: Check if SL is hit (using close price) - SL takes priority!
         if current_close <= sl:
             exit_price = sl
             exit_date = current_date
             exit_reason = 'SL'
             break
 
-        # Check if 21 trading days have passed (counting actual trading days from price_action table)
-        if idx >= 20:  # 0-indexed, so 20 means 21st trading day
+        # PRIORITY 2: Check if target is hit (using close price)
+        if current_close >= target:
+            exit_price = target
+            exit_date = current_date
+            exit_reason = 'TARGET'
+            break
+
+        # PRIORITY 3: Check if we've reached target_date - if yes, exit using high price
+        if target_date and current_date == target_date:
+            exit_price = current_high
+            exit_date = current_date
+            exit_reason = 'TARGET_DATE'
+            break
+
+        # PRIORITY 4: Check if we've passed target_date without hitting SL/target - find next date and exit
+        if target_date and current_date > target_date:
+            exit_price = current_high
+            exit_date = current_date
+            exit_reason = 'TARGET_DATE'
+            break
+
+        # PRIORITY 5: Check if 21 trading days have passed (only if no target_date is set)
+        if not target_date and idx >= 20:  # 0-indexed, so 20 means 21st trading day
             exit_price = current_close
             exit_date = current_date
             exit_reason = 'TIMEOUT'
@@ -417,7 +484,7 @@ def main():
     parser.add_argument(
         "csv_file",
         type=str,
-        help="Path to CSV file with trades (ticker, date, entry, sl, target)",
+        help="Path to CSV file with trades (ticker, date, entry, sl, target, [target_date])",
     )
     args = parser.parse_args()
 
