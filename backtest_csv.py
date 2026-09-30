@@ -196,11 +196,16 @@ def process_trade(trade, price_data):
             # Entry price is too low; order cannot be filled at that price
             return None
 
+    # Determine if target_date is in the future (beyond available data)
+    last_available_date = price_data_from_entry[-1]['date_time'].split()[0]
+    target_date_in_future = target_date and target_date > last_available_date
+
     # Track for up to 21 trading days or until target_date
     exit_price = None
     exit_date = None
     exit_reason = None
     trading_days_held = 0
+    high_on_target_date = None  # Track high price on target_date for debugging
 
     for idx, price_point in enumerate(price_data_from_entry):
         current_date = price_point['date_time'].split()[0]
@@ -209,33 +214,42 @@ def process_trade(trade, price_data):
 
         trading_days_held = idx + 1  # 1-indexed: day 1, day 2, etc.
 
-        # PRIORITY 1: Check if SL is hit (using close price) - SL takes priority!
+        # PRIORITY 1: Check if SL is hit (using close price) - SL takes priority ALWAYS!
+        # Exit at actual close price (actual loss may be worse than SL if gap down)
         if current_close <= sl:
-            exit_price = sl
+            exit_price = current_close
             exit_date = current_date
             exit_reason = 'SL'
             break
 
-        # PRIORITY 2: Check if target is hit (using close price)
-        if current_close >= target:
-            exit_price = target
-            exit_date = current_date
-            exit_reason = 'TARGET'
-            break
-
-        # PRIORITY 3: Check if we've reached target_date - if yes, exit using high price
+        # PRIORITY 2: If target_date is SPECIFIED, wait for it (ignore TARGET price)
+        # Check if we've reached target_date - if yes, exit using high price
         if target_date and current_date == target_date:
             exit_price = current_high
             exit_date = current_date
             exit_reason = 'TARGET_DATE'
+            high_on_target_date = current_high  # Capture high price on target_date
             break
 
-        # PRIORITY 4: Check if we've passed target_date without hitting SL/target - find next date and exit
+        # PRIORITY 3: If target_date is SPECIFIED and we've passed it, exit on that date
         if target_date and current_date > target_date:
             exit_price = current_high
             exit_date = current_date
             exit_reason = 'TARGET_DATE'
+            # Find and capture the high price on the original target_date if it exists
+            for prev_price_point in price_data_from_entry:
+                if prev_price_point['date_time'].split()[0] == target_date:
+                    high_on_target_date = float(str(prev_price_point['high']).replace(',', ''))
+                    break
             break
+
+        # PRIORITY 4: Only check target price if NO target_date is specified
+        if not target_date:
+            if current_close >= target:
+                exit_price = current_close
+                exit_date = current_date
+                exit_reason = 'TARGET'
+                break
 
         # PRIORITY 5: Check if 21 trading days have passed (only if no target_date is set)
         if not target_date and idx >= 20:  # 0-indexed, so 20 means 21st trading day
@@ -245,11 +259,24 @@ def process_trade(trade, price_data):
             break
 
     if exit_price is None:
-        # If we reach here, exit at last available price
+        # If we reach here, check if target_date is in future (beyond available data)
+        last_available_date = price_data_from_entry[-1]['date_time'].split()[0]
         exit_price = float(str(price_data_from_entry[-1]['close']).replace(',', ''))
-        exit_date = price_data_from_entry[-1]['date_time'].split()[0]
-        exit_reason = 'TIMEOUT'
+        exit_date = last_available_date
         trading_days_held = len(price_data_from_entry)
+
+        # If target_date is beyond last available data, mark as UNREALIZED
+        if target_date and target_date > last_available_date:
+            exit_reason = 'UNREALIZED'
+        else:
+            exit_reason = 'TIMEOUT'
+
+        # Try to find high price on target_date if it exists in data
+        if target_date:
+            for price_point in price_data_from_entry:
+                if price_point['date_time'].split()[0] == target_date:
+                    high_on_target_date = float(str(price_point['high']).replace(',', ''))
+                    break
 
     # Calculate P&L
     pnl = exit_price - entry_price
@@ -261,6 +288,8 @@ def process_trade(trade, price_data):
         'entry_price': entry_price,
         'sl': sl,
         'target': target,
+        'target_date': target_date,
+        'high_on_target_date': high_on_target_date,
         'exit_date': exit_date,
         'exit_price': exit_price,
         'exit_reason': exit_reason,
@@ -294,8 +323,13 @@ def merge_overlapping_trades(trades_with_results):
     return trades_with_results
 
 
-def backtest(csv_file):
-    """Run backtest on CSV trades."""
+def backtest(csv_file, return_stats=False):
+    """Run backtest on CSV trades.
+
+    Args:
+        csv_file: Path to CSV file
+        return_stats: If True, return year-wise stats instead of just printing
+    """
     print("=" * 120)
     print(f"📊 BACKTEST ANALYSIS - CSV: {csv_file}")
     print("=" * 120)
@@ -318,11 +352,21 @@ def backtest(csv_file):
     for trade in trades:
         ticker = trade['ticker']
         entry_date = trade['date']
+        target_date = trade.get('target_date')
 
-        # Fetch price data from entry date onwards (fetch much more to get 21 trading days)
-        # We fetch 60 calendar days to be safe, as it should cover 21 trading days
+        # Calculate fetch window
+        # For target_date: try to fetch until target_date + 5 days buffer
+        # But the actual fetch will be constrained by what's available in the database
         entry_dt = datetime.strptime(entry_date, "%Y-%m-%d")
-        end_dt = entry_dt + timedelta(days=60)  # Fetch 60 calendar days to ensure we get 21 trading days
+
+        if target_date:
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+            # Request up to target_date + 5 days, but DB query will return only what exists
+            end_dt = target_dt + timedelta(days=5)
+        else:
+            # Default: fetch 60 calendar days (covers 21 trading days + buffer)
+            end_dt = entry_dt + timedelta(days=60)
+
         end_date = end_dt.strftime("%Y-%m-%d")
 
         # Fetch price data
@@ -366,8 +410,11 @@ def backtest(csv_file):
         print("No trades completed")
         return
 
+    # Get stock symbol from results
+    stock_symbol = results[0]['ticker'] if results else 'UNKNOWN'
+
     # Display entry validation summary
-    print(f"\n📊 ENTRY VALIDATION SUMMARY")
+    print(f"\n📊 ENTRY VALIDATION SUMMARY - {stock_symbol}")
     print(f"Total trades loaded:          {len(trades)}")
     print(f"Trades that passed entry validation (filled): {len(results)}")
     print(f"Trades skipped (entry price too low):         {skipped_entry_validation}")
@@ -378,12 +425,12 @@ def backtest(csv_file):
     results.sort(key=lambda x: x['entry_date'])
 
     # Display results
-    print(f"\n{'Entry Date':<12} {'Exit Date':<12} {'Ticker':<8} {'Entry':>10} {'SL':>10} {'Target':>10} {'Exit':>10} {'Reason':<10} {'P&L %':>8} {'Days':>5}")
-    print("-" * 140)
+    print(f"\n{'Entry Date':<12} {'Exit Date':<12} {'Ticker':<8} {'Entry':>10} {'SL':>10} {'Target':>10} {'Sell':>10} {'P&L %':>8} {'Days':>5}")
+    print("-" * 115)
 
     for result in results:
         p_l_symbol = "+" if result['pnl_pct'] >= 0 else ""
-        print(f"{result['entry_date']:<12} {result['exit_date']:<12} {result['ticker']:<8} {result['entry_price']:>10.2f} {result['sl']:>10.2f} {result['target']:>10.2f} {result['exit_price']:>10.2f} {result['exit_reason']:<10} {p_l_symbol}{result['pnl_pct']:>7.2f}% {result['days_held']:>5}")
+        print(f"{result['entry_date']:<12} {result['exit_date']:<12} {result['ticker']:<8} {result['entry_price']:>10.2f} {result['sl']:>10.2f} {result['target']:>10.2f} {result['exit_price']:>10.2f} {p_l_symbol}{result['pnl_pct']:>7.2f}% {result['days_held']:>5}")
 
     # Year-wise P&L Analysis
     year_stats = {}
@@ -415,10 +462,19 @@ def backtest(csv_file):
 
     # Display Year-wise P&L
     print("\n" + "=" * 110)
-    print("📊 YEAR-WISE P&L STATEMENT")
+    print(f"📊 YEAR-WISE P&L STATEMENT - {stock_symbol}")
     print("=" * 110)
     print(f"{'Year':<8} {'Trades':>8} {'Winning':>10} {'Losing':>10} {'Breakeven':>10} {'Win Rate':>12} {'Total P&L %':>12} {'Avg Win %':>12} {'Avg Loss %':>12}")
     print("-" * 110)
+
+    # Calculate totals
+    total_trades = 0
+    total_winning = 0
+    total_losing = 0
+    total_breakeven = 0
+    total_pnl = 0
+    total_win_pnl = 0
+    total_loss_pnl = 0
 
     for year in sorted(year_stats.keys()):
         stats = year_stats[year]
@@ -429,11 +485,28 @@ def backtest(csv_file):
         pnl_symbol = "+" if stats['total_pnl'] >= 0 else ""
         print(f"{year:<8} {stats['trades']:>8} {stats['winning']:>10} {stats['losing']:>10} {stats['breakeven']:>10} {win_rate:>11.1f}% {pnl_symbol}{stats['total_pnl']:>11.2f}% {avg_win:>11.2f}% {avg_loss:>11.2f}%")
 
+        # Accumulate totals
+        total_trades += stats['trades']
+        total_winning += stats['winning']
+        total_losing += stats['losing']
+        total_breakeven += stats['breakeven']
+        total_pnl += stats['total_pnl']
+        total_win_pnl += stats['win_pnl']
+        total_loss_pnl += stats['loss_pnl']
+
+    # Display total row
+    print("-" * 110)
+    total_win_rate = (total_winning / total_trades * 100) if total_trades > 0 else 0
+    total_avg_win = (total_win_pnl / total_winning) if total_winning > 0 else 0
+    total_avg_loss = (total_loss_pnl / total_losing) if total_losing > 0 else 0
+    pnl_symbol = "+" if total_pnl >= 0 else ""
+    print(f"{'TOTAL':<8} {total_trades:>8} {total_winning:>10} {total_losing:>10} {total_breakeven:>10} {total_win_rate:>11.1f}% {pnl_symbol}{total_pnl:>11.2f}% {total_avg_win:>11.2f}% {total_avg_loss:>11.2f}%")
+
     print("=" * 110)
 
     # Display skipped trades if any
     if skipped_trades:
-        print(f"\n❌ SKIPPED TRADES ({len(skipped_trades)} total)")
+        print(f"\n❌ SKIPPED TRADES - {stock_symbol} ({len(skipped_trades)} total)")
         print("=" * 130)
         print(f"{'Entry Date':<12} {'Ticker':<8} {'Entry':>10} {'SL':>10} {'Target':>10} {'Skip Reason':<80}")
         print("-" * 130)
@@ -456,7 +529,7 @@ def backtest(csv_file):
 
     # Display summary
     print("\n" + "=" * 100)
-    print("📈 BACKTEST SUMMARY")
+    print(f"📈 BACKTEST SUMMARY - {stock_symbol}")
     print("=" * 100)
     print(f"Total Trades:        {total_trades}")
     print(f"Winning Trades:      {winning_trades} ({winning_trades/total_trades*100:.1f}%)")
@@ -476,24 +549,133 @@ def backtest(csv_file):
 
     print("=" * 100)
 
+    # Return stats if requested (for consolidation)
+    if return_stats:
+        return {
+            'ticker': stock_symbol,
+            'year_stats': year_stats,
+            'total_trades': total_trades,
+            'total_winning': total_winning,
+            'total_losing': total_losing,
+            'total_breakeven': total_breakeven,
+            'total_pnl': total_pnl,
+            'total_win_pnl': total_win_pnl,
+            'total_loss_pnl': total_loss_pnl
+        }
+
+
+def write_consolidated_pnl(all_stats):
+    """Write consolidated YEAR-WISE P&L STATEMENT for all stocks to a text file."""
+    output_folder = Path(__file__).parent / "output"
+    output_file = output_folder / "CONSOLIDATED_YEAR_WISE_PNL.txt"
+
+    with open(output_file, 'w') as f:
+        f.write("=" * 130 + "\n")
+        f.write("CONSOLIDATED YEAR-WISE P&L STATEMENT - ALL STOCKS\n")
+        f.write("=" * 130 + "\n\n")
+
+        for stock_data in all_stats:
+            ticker = stock_data['ticker']
+            year_stats = stock_data['year_stats']
+
+            f.write(f"\n{'='*110}\n")
+            f.write(f"📊 {ticker}\n")
+            f.write(f"{'='*110}\n")
+            f.write(f"{'Year':<8} {'Trades':>8} {'Winning':>10} {'Losing':>10} {'Breakeven':>10} {'Win Rate':>12} {'Total P&L %':>12} {'Avg Win %':>12} {'Avg Loss %':>12}\n")
+            f.write(f"{'-'*110}\n")
+
+            # Collect totals for this stock
+            total_trades = 0
+            total_winning = 0
+            total_losing = 0
+            total_breakeven = 0
+            total_pnl = 0
+            total_win_pnl = 0
+            total_loss_pnl = 0
+
+            for year in sorted(year_stats.keys()):
+                stats = year_stats[year]
+                win_rate = (stats['winning'] / stats['trades'] * 100) if stats['trades'] > 0 else 0
+                avg_win = (stats['win_pnl'] / stats['winning']) if stats['winning'] > 0 else 0
+                avg_loss = (stats['loss_pnl'] / stats['losing']) if stats['losing'] > 0 else 0
+
+                pnl_symbol = "+" if stats['total_pnl'] >= 0 else ""
+                f.write(f"{year:<8} {stats['trades']:>8} {stats['winning']:>10} {stats['losing']:>10} {stats['breakeven']:>10} {win_rate:>11.1f}% {pnl_symbol}{stats['total_pnl']:>11.2f}% {avg_win:>11.2f}% {avg_loss:>11.2f}%\n")
+
+                # Accumulate totals
+                total_trades += stats['trades']
+                total_winning += stats['winning']
+                total_losing += stats['losing']
+                total_breakeven += stats['breakeven']
+                total_pnl += stats['total_pnl']
+                total_win_pnl += stats['win_pnl']
+                total_loss_pnl += stats['loss_pnl']
+
+            # Display total row for this stock
+            f.write(f"{'-'*110}\n")
+            total_win_rate = (total_winning / total_trades * 100) if total_trades > 0 else 0
+            total_avg_win = (total_win_pnl / total_winning) if total_winning > 0 else 0
+            total_avg_loss = (total_loss_pnl / total_losing) if total_losing > 0 else 0
+            pnl_symbol = "+" if total_pnl >= 0 else ""
+            f.write(f"{'TOTAL':<8} {total_trades:>8} {total_winning:>10} {total_losing:>10} {total_breakeven:>10} {total_win_rate:>11.1f}% {pnl_symbol}{total_pnl:>11.2f}% {total_avg_win:>11.2f}% {total_avg_loss:>11.2f}%\n")
+
+        f.write(f"\n{'='*130}\n")
+        f.write("End of Consolidated Report\n")
+        f.write(f"{'='*130}\n")
+
+    print(f"\n✅ Consolidated P&L report written to: {output_file}")
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Backtest trading strategy from CSV file"
+        description="Backtest trading strategy from CSV file(s)"
     )
     parser.add_argument(
         "csv_file",
         type=str,
+        nargs='?',
         help="Path to CSV file with trades (ticker, date, entry, sl, target, [target_date])",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run backtest on all CSV files in the output folder"
     )
     args = parser.parse_args()
 
-    csv_path = Path(args.csv_file)
-    if not csv_path.exists():
-        print(f"CSV file not found: {csv_path}")
-        return
+    if args.all:
+        # Run backtest on all CSV files in output folder
+        output_folder = Path(__file__).parent / "output"
+        csv_files = sorted(output_folder.glob("*.csv"))
 
-    backtest(csv_path)
+        if not csv_files:
+            print(f"No CSV files found in {output_folder}")
+            return
+
+        print(f"Found {len(csv_files)} CSV file(s) in {output_folder}\n")
+
+        # Collect stats from all stocks
+        all_stats = []
+        for csv_file in csv_files:
+            print("\n" + "=" * 120)
+            stats = backtest(csv_file, return_stats=True)
+            if stats:
+                all_stats.append(stats)
+
+        # Write consolidated file
+        if all_stats:
+            write_consolidated_pnl(all_stats)
+    else:
+        if not args.csv_file:
+            parser.print_help()
+            return
+
+        csv_path = Path(args.csv_file)
+        if not csv_path.exists():
+            print(f"CSV file not found: {csv_path}")
+            return
+
+        backtest(csv_path)
 
 
 if __name__ == "__main__":
