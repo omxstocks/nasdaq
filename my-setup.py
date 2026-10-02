@@ -40,6 +40,7 @@ def export_data(symbol=None, from_date=None, to_date=None, trend="all"):
 
         # 3. Build SQL Query based on trend parameter
         trend_lower = trend.lower()
+        
         if trend_lower == "up":
             trend_condition = "(ema_21 > ema_50)"
             print(f"Filtering for UPTREND only: {trend_condition}")
@@ -63,7 +64,11 @@ def export_data(symbol=None, from_date=None, to_date=None, trend="all"):
                 WHEN ema_21 > ema_50 THEN ROUND((donchian_resistance + (donchian_resistance / 3.0)), 2)
                 ELSE ROUND(donchian_resistance, 2)
             END AS target,
-            DATE(date_time, '+28 days') AS target_date
+            DATE(date_time, '+28 days') AS target_date,
+            CASE
+                WHEN ema_21 > ema_50 THEN 'UP'
+                ELSE 'DOWN'
+            END AS trend
         FROM price_action
         WHERE symbol = ?
           AND date_time BETWEEN ? AND ?
@@ -82,6 +87,18 @@ def export_data(symbol=None, from_date=None, to_date=None, trend="all"):
             df = pd.read_sql_query(
                 query, conn, params=(sym, from_date, to_date)
             )
+
+            # Convert date to string format (date only, no time)
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+
+            # Round entry, sl, target to max 2 decimal places
+            if 'entry' in df.columns:
+                df['entry'] = df['entry'].round(2)
+            if 'sl' in df.columns:
+                df['sl'] = df['sl'].round(2)
+            if 'target' in df.columns:
+                df['target'] = df['target'].round(2)
 
             # Export to CSV
             df.to_csv(file_path, index=False)

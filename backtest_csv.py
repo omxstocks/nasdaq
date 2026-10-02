@@ -131,7 +131,7 @@ def fetch_price_data(ticker, start_date, end_date):
         cursor = conn.cursor()
 
         query = """
-            SELECT date_time, close, high, low
+            SELECT date_time, open, close, high, low
             FROM price_action
             WHERE symbol = ? AND date(date_time) >= ? AND date(date_time) <= ?
             ORDER BY date_time ASC
@@ -181,26 +181,77 @@ def process_trade(trade, price_data):
     if not price_data:
         return None
 
-    # Filter price data from entry date onwards
-    price_data_from_entry = [p for p in price_data if p['date_time'].split()[0] >= entry_date]
-
-    if not price_data_from_entry:
+    # Validate trade parameters
+    if sl >= entry_price:
+        # SL must be less than entry price
         return None
 
-    # Validate entry: entry_price must be >= low price of next trading day
-    # This simulates a "Good Till" order placed in evening for next day
-    # If entry_price < low of next day, the order won't be filled
-    if len(price_data_from_entry) > 0:
-        next_day_low = float(str(price_data_from_entry[0]['low']).replace(',', ''))
-        if entry_price < next_day_low:
-            # Entry price is too low; order cannot be filled at that price
-            return None
+    if target <= entry_price:
+        # Target must be greater than entry price
+        return None
+
+    # Validate target_date: if it's not greater than entry_date, ignore it
+    if target_date:
+        if target_date <= entry_date:
+            target_date = None  # Treat as if no target_date was specified
+
+    # Find the entry date in price data
+    entry_date_idx = None
+    for idx, price_point in enumerate(price_data):
+        if price_point['date_time'].split()[0] == entry_date:
+            entry_date_idx = idx
+            break
+
+    if entry_date_idx is None:
+        # Entry date is not a trading day (weekend/holiday); skip the trade
+        return None
+
+    # Check if there are at least 5 more trading days available
+    if entry_date_idx + 5 >= len(price_data):
+        # Not enough trading days available; skip the trade
+        return None
+
+    # Look for the first day within 5 trading days where order can fill
+    # Entry is a limit order: fills if entry_price >= LOW price on that day
+    fill_day_idx = None
+    for days_ahead in range(1, 6):  # Check next 5 trading days (1 to 5)
+        check_idx = entry_date_idx + days_ahead
+        if check_idx >= len(price_data):
+            break
+
+        day_low = float(str(price_data[check_idx]['low']).replace(',', ''))
+        if entry_price >= day_low:
+            # Order can fill on this day
+            fill_day_idx = check_idx
+            break
+
+    if fill_day_idx is None:
+        # Order could not fill within 5 trading days
+        return None
+
+    # Determine actual entry price based on fill day's open
+    # If entry_price < open: Buy at entry_price (better fill)
+    # If entry_price >= open: Buy at open price
+    fill_day = price_data[fill_day_idx]
+    fill_day_open = float(str(fill_day['open']).replace(',', '')) if 'open' in fill_day else None
+
+    if fill_day_open:
+        if entry_price < fill_day_open:
+            actual_entry_price = entry_price
+        else:
+            actual_entry_price = fill_day_open
+    else:
+        actual_entry_price = entry_price
+
+    # Filter price data from the fill day onwards (where trade actually fills)
+    price_data_from_entry = price_data[fill_day_idx:]
 
     # Determine if target_date is in the future (beyond available data)
     last_available_date = price_data_from_entry[-1]['date_time'].split()[0]
     target_date_in_future = target_date and target_date > last_available_date
 
     # Track for up to 21 trading days or until target_date
+    # price_data_from_entry starts from the next trading day (where trade fills)
     exit_price = None
     exit_date = None
     exit_reason = None
@@ -211,12 +262,21 @@ def process_trade(trade, price_data):
         current_date = price_point['date_time'].split()[0]
         current_close = float(str(price_point['close']).replace(',', ''))
         current_high = float(str(price_point['high']).replace(',', ''))
+        current_low = float(str(price_point['low']).replace(',', ''))
 
-        trading_days_held = idx + 1  # 1-indexed: day 1, day 2, etc.
+        trading_days_held = idx + 1  # idx 0 = day 1, idx 1 = day 2, etc.
 
-        # PRIORITY 1: Check if SL is hit (using close price) - SL takes priority ALWAYS!
-        # Exit at actual close price (actual loss may be worse than SL if gap down)
-        if current_close <= sl:
+        # PRIORITY 1: Check if SL is hit - SL takes priority ALWAYS!
+        # If low price touches or goes below SL, exit at SL level
+        # Otherwise if close is below SL, exit at close
+        if current_low <= sl:
+            # Price went below SL during the day, exit at SL level
+            exit_price = sl
+            exit_date = current_date
+            exit_reason = 'SL'
+            break
+        elif current_close <= sl:
+            # Close is below SL, exit at close price
             exit_price = current_close
             exit_date = current_date
             exit_reason = 'SL'
@@ -245,14 +305,14 @@ def process_trade(trade, price_data):
 
         # PRIORITY 4: Only check target price if NO target_date is specified
         if not target_date:
-            if current_close >= target:
-                exit_price = current_close
+            if current_high >= target:
+                exit_price = target
                 exit_date = current_date
                 exit_reason = 'TARGET'
                 break
 
         # PRIORITY 5: Check if 21 trading days have passed (only if no target_date is set)
-        if not target_date and idx >= 20:  # 0-indexed, so 20 means 21st trading day
+        if not target_date and idx >= 20:  # idx starts at 0; idx=20 means 21st trading day
             exit_price = current_close
             exit_date = current_date
             exit_reason = 'TIMEOUT'
@@ -261,15 +321,39 @@ def process_trade(trade, price_data):
     if exit_price is None:
         # If we reach here, check if target_date is in future (beyond available data)
         last_available_date = price_data_from_entry[-1]['date_time'].split()[0]
-        exit_price = float(str(price_data_from_entry[-1]['close']).replace(',', ''))
-        exit_date = last_available_date
         trading_days_held = len(price_data_from_entry)
 
-        # If target_date is beyond last available data, mark as UNREALIZED
-        if target_date and target_date > last_available_date:
+        # If target_date is in future AND SL has not been hit, keep trade as UNREALIZED (don't sell)
+        if target_date_in_future:
+            # Get current close price (last available price)
+            current_close = float(str(price_data_from_entry[-1]['close']).replace(',', ''))
+            unrealized_pnl = current_close - actual_entry_price
+            unrealized_pnl_pct = (unrealized_pnl / actual_entry_price) * 100
+
             exit_reason = 'UNREALIZED'
-        else:
-            exit_reason = 'TIMEOUT'
+            # Don't set exit_price/exit_date - keep trade open
+            return {
+                'ticker': trade['ticker'],
+                'entry_date': entry_date,
+                'entry_price': actual_entry_price,
+                'sl': sl,
+                'target': target,
+                'target_date': target_date,
+                'high_on_target_date': high_on_target_date,
+                'current_close': round(current_close, 2),
+                'unrealized_pnl_pct': round(unrealized_pnl_pct, 2),
+                'exit_date': None,
+                'exit_price': None,
+                'exit_reason': 'UNREALIZED',
+                'pnl': None,
+                'pnl_pct': None,
+                'days_held': trading_days_held
+            }
+
+        # Otherwise, exit at last available price with TIMEOUT
+        exit_price = float(str(price_data_from_entry[-1]['close']).replace(',', ''))
+        exit_date = last_available_date
+        exit_reason = 'TIMEOUT'
 
         # Try to find high price on target_date if it exists in data
         if target_date:
@@ -278,14 +362,18 @@ def process_trade(trade, price_data):
                     high_on_target_date = float(str(price_point['high']).replace(',', ''))
                     break
 
-    # Calculate P&L
-    pnl = exit_price - entry_price
-    pnl_pct = (pnl / entry_price) * 100
+    # Calculate P&L using actual entry price (OPEN price of next day)
+    pnl = exit_price - actual_entry_price
+    pnl_pct = (pnl / actual_entry_price) * 100
+
+    # Get the actual buy date (when order fills)
+    buy_date = fill_day['date_time'].split()[0]
 
     return {
         'ticker': trade['ticker'],
         'entry_date': entry_date,
-        'entry_price': entry_price,
+        'buy_date': buy_date,
+        'entry_price': actual_entry_price,
         'sl': sl,
         'target': target,
         'target_date': target_date,
@@ -384,17 +472,49 @@ def backtest(csv_file, return_stats=False):
             skipped_no_data += 1
             continue
 
+        # Validate trade parameters before processing
+        sl = trade['sl']
+        entry = trade['entry']
+        target = trade['target']
+
+        skip_reason = None
+        if sl >= entry:
+            skip_reason = f'INVALID_SL (SL: {sl:.2f} >= Entry: {entry:.2f})'
+        elif target <= entry:
+            skip_reason = f'INVALID_TARGET (Target: {target:.2f} <= Entry: {entry:.2f})'
+
+        if skip_reason:
+            skipped_trades.append({
+                'entry_date': entry_date,
+                'ticker': ticker,
+                'entry': trade['entry'],
+                'sl': trade['sl'],
+                'target': trade['target'],
+                'skip_reason': skip_reason
+            })
+            skipped_entry_validation += 1
+            continue
+
         # Process trade (will count trading days from price_action table)
         result = process_trade(trade, price_data)
         if result:
             results.append(result)
         else:
-            # Trade was skipped due to entry validation (entry_price < next_day_low)
-            if len(price_data) > 0:
-                next_day_low = float(str(price_data[0]['low']).replace(',', ''))
+            # Trade was skipped due to entry validation
+            # Find entry_date in price_data to get next trading day low
+            entry_date_idx = None
+            for idx, price_point in enumerate(price_data):
+                if price_point['date_time'].split()[0] == entry_date:
+                    entry_date_idx = idx
+                    break
+
+            if entry_date_idx is not None and entry_date_idx + 1 < len(price_data):
+                next_day_low = float(str(price_data[entry_date_idx + 1]['low']).replace(',', ''))
                 skip_reason = f'ENTRY_TOO_LOW (Entry: {trade["entry"]:.2f} < Next Low: {next_day_low:.2f})'
+            elif entry_date_idx is None:
+                skip_reason = 'ENTRY_DATE_NOT_TRADING_DAY'
             else:
-                skip_reason = 'ENTRY_TOO_LOW'
+                skip_reason = 'NO_NEXT_TRADING_DAY'
 
             skipped_trades.append({
                 'entry_date': entry_date,
@@ -406,12 +526,12 @@ def backtest(csv_file, return_stats=False):
             })
             skipped_entry_validation += 1
 
-    if not results:
-        print("No trades completed")
-        return
+    # Get stock symbol from trades (for display)
+    stock_symbol = trades[0]['ticker'] if trades else 'UNKNOWN'
 
-    # Get stock symbol from results
-    stock_symbol = results[0]['ticker'] if results else 'UNKNOWN'
+    # Separate completed trades from unrealized trades
+    completed_trades = [r for r in results if r['exit_price'] is not None] if results else []
+    unrealized_trades = [r for r in results if r['exit_price'] is None] if results else []
 
     # Display entry validation summary
     print(f"\n📊 ENTRY VALIDATION SUMMARY - {stock_symbol}")
@@ -421,20 +541,37 @@ def backtest(csv_file, return_stats=False):
     print(f"Trades skipped (no price data):               {skipped_no_data}")
     print(f"Pass rate: {len(results)/len(trades)*100:.1f}%\n")
 
-    # Sort results by entry date in ascending order
-    results.sort(key=lambda x: x['entry_date'])
+    # Sort completed trades by buy date in ascending order
+    completed_trades.sort(key=lambda x: x['buy_date'])
 
-    # Display results
-    print(f"\n{'Entry Date':<12} {'Exit Date':<12} {'Ticker':<8} {'Entry':>10} {'SL':>10} {'Target':>10} {'Sell':>10} {'P&L %':>8} {'Days':>5}")
-    print("-" * 115)
+    # Display completed trades results
+    if completed_trades:
+        print(f"\n{'Buy Date':<12} {'Exit Date':<12} {'Ticker':<8} {'Entry':>10} {'SL':>10} {'Target':>10} {'Sell':>10} {'P&L %':>8} {'Days':>5}")
+        print("-" * 115)
 
-    for result in results:
-        p_l_symbol = "+" if result['pnl_pct'] >= 0 else ""
-        print(f"{result['entry_date']:<12} {result['exit_date']:<12} {result['ticker']:<8} {result['entry_price']:>10.2f} {result['sl']:>10.2f} {result['target']:>10.2f} {result['exit_price']:>10.2f} {p_l_symbol}{result['pnl_pct']:>7.2f}% {result['days_held']:>5}")
+        for result in completed_trades:
+            p_l_symbol = "+" if result['pnl_pct'] >= 0 else ""
+            print(f"{result['buy_date']:<12} {result['exit_date']:<12} {result['ticker']:<8} {result['entry_price']:>10.2f} {result['sl']:>10.2f} {result['target']:>10.2f} {result['exit_price']:>10.2f} {p_l_symbol}{result['pnl_pct']:>7.2f}% {result['days_held']:>5}")
 
-    # Year-wise P&L Analysis
+    # Display unrealized trades section (if any)
+    if unrealized_trades:
+        unrealized_trades.sort(key=lambda x: x['buy_date'])
+        print(f"\n📈 UNREALIZED TRADES - {stock_symbol} ({len(unrealized_trades)} total)")
+        print("=" * 145)
+        print(f"{'Buy Date':<12} {'Target Date':<12} {'Ticker':<8} {'Entry':>10} {'SL':>10} {'Target':>10} {'Current':>10} {'Unrealized %':>12} {'Days Held':>10}")
+        print("-" * 145)
+
+        for trade in unrealized_trades:
+            target_date_str = trade.get('target_date', '-') or '-'
+            current_close = trade.get('current_close', 0)
+            unrealized_pnl_pct = trade.get('unrealized_pnl_pct', 0)
+            pnl_symbol = "+" if unrealized_pnl_pct >= 0 else ""
+            print(f"{trade['buy_date']:<12} {target_date_str:<12} {trade['ticker']:<8} {trade['entry_price']:>10.2f} {trade['sl']:>10.2f} {trade['target']:>10.2f} {current_close:>10.2f} {pnl_symbol}{unrealized_pnl_pct:>11.2f}% {trade['days_held']:>10}")
+        print("=" * 145)
+
+    # Year-wise P&L Analysis (only for completed trades)
     year_stats = {}
-    for result in results:
+    for result in completed_trades:
         year = result['exit_date'][:4]  # Extract year from exit_date
 
         if year not in year_stats:
@@ -516,33 +653,39 @@ def backtest(csv_file, return_stats=False):
 
         print("=" * 130)
 
-    # Calculate summary statistics
-    total_pnl_pct = sum(r['pnl_pct'] for r in results)
-    winning_trades = sum(1 for r in results if r['pnl_pct'] > 0)
-    losing_trades = sum(1 for r in results if r['pnl_pct'] < 0)
-    breakeven_trades = sum(1 for r in results if r['pnl_pct'] == 0)
-    total_trades = len(results)
+    # Calculate summary statistics (only for completed trades)
+    total_pnl_pct = sum(r['pnl_pct'] for r in completed_trades)
+    winning_trades = sum(1 for r in completed_trades if r['pnl_pct'] > 0)
+    losing_trades = sum(1 for r in completed_trades if r['pnl_pct'] < 0)
+    breakeven_trades = sum(1 for r in completed_trades if r['pnl_pct'] == 0)
+    total_trades = len(completed_trades)
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
 
-    avg_win = sum(r['pnl_pct'] for r in results if r['pnl_pct'] > 0) / winning_trades if winning_trades > 0 else 0
-    avg_loss = sum(r['pnl_pct'] for r in results if r['pnl_pct'] < 0) / losing_trades if losing_trades > 0 else 0
+    avg_win = sum(r['pnl_pct'] for r in completed_trades if r['pnl_pct'] > 0) / winning_trades if winning_trades > 0 else 0
+    avg_loss = sum(r['pnl_pct'] for r in completed_trades if r['pnl_pct'] < 0) / losing_trades if losing_trades > 0 else 0
 
-    # Display summary
-    print("\n" + "=" * 100)
-    print(f"📈 BACKTEST SUMMARY - {stock_symbol}")
-    print("=" * 100)
-    print(f"Total Trades:        {total_trades}")
-    print(f"Winning Trades:      {winning_trades} ({winning_trades/total_trades*100:.1f}%)")
-    print(f"Losing Trades:       {losing_trades} ({losing_trades/total_trades*100:.1f}%)")
-    print(f"Breakeven Trades:    {breakeven_trades}")
-    print(f"\nWin Rate:            {win_rate:.2f}%")
-    print(f"Total P&L %:         {total_pnl_pct:+.2f}%")
-    print(f"Average Win %:       {avg_win:+.2f}%")
-    print(f"Average Loss %:      {avg_loss:+.2f}%")
+    # Display summary (only for completed trades)
+    if total_trades > 0:
+        print("\n" + "=" * 100)
+        print(f"📈 BACKTEST SUMMARY - {stock_symbol}")
+        print("=" * 100)
+        print(f"Total Trades:        {total_trades}")
+        print(f"Winning Trades:      {winning_trades} ({winning_trades/total_trades*100:.1f}%)")
+        print(f"Losing Trades:       {losing_trades} ({losing_trades/total_trades*100:.1f}%)")
+        print(f"Breakeven Trades:    {breakeven_trades}")
+        print(f"\nWin Rate:            {win_rate:.2f}%")
+        print(f"Total P&L %:         {total_pnl_pct:+.2f}%")
+        print(f"Average Win %:       {avg_win:+.2f}%")
+        print(f"Average Loss %:      {avg_loss:+.2f}%")
+    else:
+        print("\n" + "=" * 100)
+        print(f"📈 BACKTEST SUMMARY - {stock_symbol}")
+        print("=" * 100)
+        print("No completed trades - only unrealized trades present.")
 
-    # Calculate profit factor
+    # Calculate profit factor (only for completed trades)
     if losing_trades > 0:
-        profit_factor = abs(sum(r['pnl_pct'] for r in results if r['pnl_pct'] > 0) / sum(r['pnl_pct'] for r in results if r['pnl_pct'] < 0))
+        profit_factor = abs(sum(r['pnl_pct'] for r in completed_trades if r['pnl_pct'] > 0) / sum(r['pnl_pct'] for r in completed_trades if r['pnl_pct'] < 0))
         print(f"Profit Factor:       {profit_factor:.2f}")
     else:
         print(f"Profit Factor:       N/A (no losing trades)")
